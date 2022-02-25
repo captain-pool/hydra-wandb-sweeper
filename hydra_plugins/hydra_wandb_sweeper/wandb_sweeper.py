@@ -159,7 +159,8 @@ class WandbSweeper(sweeper.Sweeper):
     def wandb_task(self, base_config, task_function, count):
         def run():
             with wandb.init(resume=self._preemptible) as run:
-                wandb.mark_preempting()
+                if self._preemptible:
+                    wandb.mark_preempting()
                 run_id = run.id
                 override_config = run.config
             override_config = omegaconf.DictConfig(override_config.as_dict())
