@@ -6,9 +6,9 @@ from omegaconf import DictConfig
 
 
 @dataclass
-class ScalarConfigSpec:
+class WandbParameterSpec:
     """Representation of all the options to define
-    a scalar.
+    a Wandb parameter.
     """
 
     # (int or float) Maximum and minimum values.
