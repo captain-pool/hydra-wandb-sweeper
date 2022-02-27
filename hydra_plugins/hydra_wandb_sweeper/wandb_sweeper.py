@@ -1,10 +1,10 @@
 import functools
-import itertools
 import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, MutableMapping, MutableSequence, Optional, Union
 
+import __main__
 import omegaconf
 import wandb
 from hydra.core import plugins
@@ -17,9 +17,11 @@ from hydra.core.override_parser.types import (
     RangeSweep,
     Transformer,
 )
-from hydra.plugins import sweeper
+from hydra.plugins.sweeper import Sweeper
+from hydra.types import HydraContext, TaskFunction
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from wandb.apis import InternalApi
+from wandb.sdk.wandb_setup import _EarlyLogger
 from wandb.sdk.wandb_sweep import _get_sweep_url
 
 from hydra_plugins.hydra_wandb_sweeper.config import WandbParameterSpec
@@ -40,6 +42,54 @@ SUPPORTED_DISTRIBUTIONS = {
     "log_normal": ["mu", "sigma"],
     "q_log_normal": ["mu", "sigma", "q"],
 }
+
+
+original_cwd = os.getcwd()
+
+
+def __init__(self, root=None, remote="origin", lazy=True):
+    self.remote_name = remote
+    self._root = original_cwd
+    self._repo = None
+    if not lazy:
+        self.repo
+
+
+# Monkeypatching GitRepo to use the original working directory as the root.
+# This will allow wandb's code save features to be used properly when the hydra
+# cwd is different than the code directory.
+wandb.sdk.lib.git.GitRepo.__init__ = __init__
+
+
+def _get_program_relpath_from_gitrepo(
+    program: str, _logger: Optional[_EarlyLogger] = None
+) -> Optional[str]:
+    repo = wandb.sdk.lib.git.GitRepo()
+    root = repo.root
+    if not root:
+        root = os.getcwd()
+    full_path_to_program = os.path.join(
+        root, os.path.relpath(original_cwd, root), program
+    )
+    if os.path.exists(full_path_to_program):
+        relative_path = os.path.relpath(full_path_to_program, start=root)
+        if "../" in relative_path:
+            if _logger:
+                _logger.warning("could not save program above cwd: %s" % program)
+            return None
+        return relative_path
+
+    if _logger:
+        _logger.warning("could not find program at %s" % program)
+    return None
+
+
+# Monkeypatching to force wandb to use the original cwd when creating
+# full_path_to_program. Otherwise the hydra cwd would be used, which could
+# be located away from the code directory.
+wandb.sdk.wandb_settings._get_program_relpath_from_gitrepo = (
+    _get_program_relpath_from_gitrepo
+)
 
 
 def is_wandb_override(override: Override) -> bool:
@@ -158,7 +208,7 @@ def flatten_dict(d: MutableMapping, parent_key: str = "", sep: str = "."):
 # and instead return "value" or "values" if the user provides a single value
 # or a list of values. This means we need to verify that "distribution" isn't
 # provided by the user in any of the params to be sweeped through.
-class WandbSweeper(sweeper.Sweeper):
+class WandbSweeper(Sweeper):
     def __init__(
         self, wandb_sweep_config: omegaconf.DictConfig, params: Optional[DictConfig]
     ) -> None:
@@ -173,19 +223,25 @@ class WandbSweeper(sweeper.Sweeper):
                 str(x): create_wandb_param_from_config(y) for x, y in params.items()
             }
 
-        self.agent_run_count = self.wandb_sweep_config.get("count", None)
+        self.agent_run_count: Optional[int] = None
+        self.job_idx: Optional[int] = None
 
-        self.job_idx = itertools.count(0)
-
-    def setup(self, config, hydra_context, task_function) -> None:
+    def setup(
+        self,
+        *,
+        hydra_context: HydraContext,
+        task_function: TaskFunction,
+        config: DictConfig,
+    ) -> None:
         self.config = config
-
+        self.agent_run_count = self.wandb_sweep_config.get("count", None)
         self._task_function = functools.partial(
             self.wandb_task,
             task_function=task_function,
             count=self.agent_run_count,
         )
         self.hydra_context = hydra_context
+        self.job_idx = 0
 
         self.launcher = plugins.Plugins.instance().instantiate_launcher(
             config=config,
@@ -208,11 +264,18 @@ class WandbSweeper(sweeper.Sweeper):
                 {"early_terminate": omegaconf.OmegaConf.to_container(early_terminate)}
             )
 
+        self.program = __main__.__file__
+        self.program_relpath = __main__.__file__
+
     @property
-    def sweep_id(self):
+    def sweep_id(self) -> Any:
         return self._sweep_id
 
     def sweep(self, arguments: List[str]) -> None:
+        assert self.config is not None
+        assert self.launcher is not None
+        assert self.job_idx is not None
+
         parser = overrides_parser.OverridesParser.create()
         parsed = parser.parse_overrides(arguments)
         sweep_id = self.wandb_sweep_config["sweep_id"]
@@ -232,7 +295,7 @@ class WandbSweeper(sweeper.Sweeper):
 
         LOGGER.info(
             f"WandbSweeper(method={self.wandb_sweep_config.method}, "
-            f"num_agents={self.wandb_sweep_config.num_agets}, count={self.wandb_sweep_config.count}, "
+            f"num_agents={self.wandb_sweep_config.num_agents}, count={self.wandb_sweep_config.count}, "
             f"entity={self.wandb_sweep_config.entity}, project={self.wandb_sweep_config.project}, "
             f"name={self.wandb_sweep_config.name})"
         )
@@ -241,6 +304,7 @@ class WandbSweeper(sweeper.Sweeper):
 
         wandb_api = InternalApi()
         if not sweep_id:
+            os.environ[wandb.env.PROGRAM] = self.program
             # Wandb sweep controller will only sweep through
             # params provided by self.sweep_dict
             sweep_id = wandb.sweep(
@@ -249,11 +313,11 @@ class WandbSweeper(sweeper.Sweeper):
                 project=self.wandb_sweep_config.project,
             )
             LOGGER.info(
-                f"Starting Sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
+                f"Starting Wandb sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
             )
         else:
             LOGGER.info(
-                f"Reusing Sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
+                f"Reusing Wandb sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
             )
         self._sweep_id = sweep_id
 
@@ -276,16 +340,34 @@ class WandbSweeper(sweeper.Sweeper):
         # plugin -> https://docs.wandb.ai/guides/sweeps/faq#how-should-i-run-sweeps-on-slurm
         # TODO: would be nice to have a budget-based approach and allow repeatedly launching
         # batches of agents until a budget is reached.
-        returns = self.launcher.launch(overrides, initial_job_idx=next(self.job_idx))
+        returns = self.launcher.launch(overrides, initial_job_idx=self.job_idx)
+        # self.job_idx += len(returns)  # TODO: use for budget approach
 
-    def wandb_task(self, base_config, task_function, count):
-        def run():
-            runtime_cfg = HydraConfig.get()
+    def wandb_task(
+        self,
+        base_config: DictConfig,
+        task_function: TaskFunction,
+        count: Optional[int] = 1,
+    ) -> None:
+        runtime_cfg = HydraConfig.get()
+        sweep_dir = Path(runtime_cfg.sweep.dir)
+        sweep_subdir = sweep_dir / Path(runtime_cfg.sweep.subdir)
+
+        os.environ[wandb.env.PROGRAM] = self.program
+        wandb_settings = wandb.Settings(
+            start_method="thread",
+            program=self.program,
+            program_relpath=self.program_relpath,
+        )
+
+        def run() -> Any:
             LOGGER.info("Agent initializing wandb...")
-            # TODO: allow user to pass in their own notes, name, and tags
+            # TODO: allow user to pass in their own notes and tags
+            # NOTE: wandb's git features won't work if hydra working dir different from code directory
             with wandb.init(
-                name=Path(os.getcwd()).name,
-                settings=wandb.Settings(start_method="thread"),
+                name=sweep_subdir.name,
+                group=sweep_dir.name,
+                settings=wandb_settings,
                 notes=OmegaConf.to_yaml(runtime_cfg.overrides.task),
                 tags=[
                     base_config.experiment.name,
@@ -311,11 +393,12 @@ class WandbSweeper(sweeper.Sweeper):
                     f"config={flatten_dict(run.config.as_dict())} at URL: {run.get_url()}"
                 )
                 LOGGER.info(f"Agent {run.id} executing task function...")
-                task_function(config, run)
+                ret = task_function(config)
                 LOGGER.info(f"Agent {run.id} finished executing task function")
+                return ret
 
         if not self.sweep_id:
             raise ValueError(f"sweep_id cannot be {self.sweep_id}")
 
-        LOGGER.info("Launching Agent...")
+        LOGGER.info("Launching Wandb agent...")
         wandb.agent(self.sweep_id, function=run, count=count)
