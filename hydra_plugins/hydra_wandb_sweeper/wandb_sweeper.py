@@ -226,6 +226,9 @@ class WandbSweeper(Sweeper):
         self.agent_run_count: Optional[int] = None
         self.job_idx: Optional[int] = None
 
+        self.wandb_tags = self.wandb_sweep_config.tags
+        self.wandb_notes = self.wandb_sweep_config.notes
+
     def setup(
         self,
         *,
@@ -234,7 +237,7 @@ class WandbSweeper(Sweeper):
         config: DictConfig,
     ) -> None:
         self.config = config
-        self.agent_run_count = self.wandb_sweep_config.get("count", None)
+        self.agent_run_count = self.wandb_sweep_config.count
         self._task_function = functools.partial(
             self.wandb_task,
             task_function=task_function,
@@ -263,6 +266,12 @@ class WandbSweeper(Sweeper):
             self.sweep_dict.update(
                 {"early_terminate": omegaconf.OmegaConf.to_container(early_terminate)}
             )
+
+        self.wandb_tags = (
+            OmegaConf.to_container(self.wandb_tags) if self.wandb_tags else None
+        )
+        if self.wandb_notes:
+            self.wandb_notes = str(OmegaConf.to_container(self.wandb_notes))
 
         self.program = __main__.__file__
         self.program_relpath = __main__.__file__
@@ -362,18 +371,15 @@ class WandbSweeper(Sweeper):
 
         def run() -> Any:
             LOGGER.info("Agent initializing wandb...")
-            # TODO: allow user to pass in their own notes and tags
+            # TODO: allow user to pass in their own notes, tags, and group
+            # TODO: test resuming sweeps and resuming runs
             # NOTE: wandb's git features won't work if hydra working dir different from code directory
             with wandb.init(
                 name=sweep_subdir.name,
                 group=sweep_dir.name,
                 settings=wandb_settings,
-                notes=OmegaConf.to_yaml(runtime_cfg.overrides.task),
-                tags=[
-                    base_config.experiment.name,
-                    base_config.model._target_,
-                    base_config.dataset.name,
-                ],
+                notes=self.wandb_notes,
+                tags=self.wandb_tags,
             ) as run:
                 override_dotlist = [
                     f"{dot}={val}" for dot, val in run.config.as_dict().items()

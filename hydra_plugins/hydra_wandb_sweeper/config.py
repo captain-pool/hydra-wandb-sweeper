@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, MutableSequence, Optional
 
 from hydra.core import config_store
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 
 
 @dataclass
@@ -55,6 +55,8 @@ class WandbConfig:
     entity: Optional[str] = None
     project: Optional[str] = None
     early_terminate: Optional[DictConfig] = DictConfig({})
+    tags: Optional[ListConfig] = ListConfig([])
+    notes: Optional[Any] = None
 
 
 @dataclass
