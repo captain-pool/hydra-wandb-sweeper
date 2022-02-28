@@ -56,6 +56,9 @@ class WandbConfig:
     project: Optional[str] = None
     early_terminate: Optional[DictConfig] = DictConfig({})
     tags: Optional[ListConfig] = ListConfig([])
+
+    # Notes can contain a string, a list, or any OmegaConf type (e.g., if you wanted to pass a config value
+    # that interoplated into a ListConfig, like ${hydra.overrides.task})
     notes: Optional[Any] = None
 
 

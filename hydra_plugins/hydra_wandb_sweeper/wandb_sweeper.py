@@ -1,4 +1,3 @@
-import functools
 import logging
 import os
 from pathlib import Path
@@ -7,6 +6,7 @@ from typing import Any, Dict, List, MutableMapping, MutableSequence, Optional, U
 import __main__
 import omegaconf
 import wandb
+import yaml
 from hydra.core import plugins
 from hydra.core.hydra_config import HydraConfig
 from hydra.core.override_parser import overrides_parser
@@ -21,12 +21,15 @@ from hydra.plugins.sweeper import Sweeper
 from hydra.types import HydraContext, TaskFunction
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from wandb.apis import InternalApi
+from wandb.sdk.lib import filesystem
 from wandb.sdk.wandb_setup import _EarlyLogger
 from wandb.sdk.wandb_sweep import _get_sweep_url
 
 from hydra_plugins.hydra_wandb_sweeper.config import WandbParameterSpec
 
-LOGGER = logging.getLogger(__name__)
+# TODO: switch to lazy %-style logging  (will make code look less readable though)
+# https://docs.python.org/3/howto/logging.html#optimization
+logger = logging.getLogger(__name__)
 
 SUPPORTED_DISTRIBUTIONS = {
     "constant": ["value"],
@@ -44,12 +47,19 @@ SUPPORTED_DISTRIBUTIONS = {
 }
 
 
-original_cwd = os.getcwd()
+__original_cwd__ = os.getcwd()
+__main_file__ = __main__.__file__
 
 
-def __init__(self, root=None, remote="origin", lazy=True):
+# Used by wandb.sweep since it checks if __stage_dir__ in wandb.old.core is set in
+# order to create it for eventually saving the sweep config yaml to. If it's not set it defaults
+# to 'wandb' + os.sep
+wandb.old.core._set_stage_dir(".wandb" + os.sep)
+
+
+def _my_gitrepo_init(self, root=None, remote="origin", lazy=True):
     self.remote_name = remote
-    self._root = original_cwd
+    self._root = __original_cwd__ if root is None else root
     self._repo = None
     if not lazy:
         self.repo
@@ -58,10 +68,40 @@ def __init__(self, root=None, remote="origin", lazy=True):
 # Monkeypatching GitRepo to use the original working directory as the root.
 # This will allow wandb's code save features to be used properly when the hydra
 # cwd is different than the code directory.
-wandb.sdk.lib.git.GitRepo.__init__ = __init__
+# Have to patch out here for submitit pickling purposes since out here is executed in the original working directory
+# before the task function is pickled via executor.map_array. After unpickling at the node for task fn execution,
+# the reference wandb.sdk.lib.git.GitRepo.__init__ -> _my_gitrepo_init is still preserved with original_cwd within
+# _my_gitrepo_init preserving its previous value.
+wandb.sdk.lib.git.GitRepo.__init__ = _my_gitrepo_init
 
 
-def _get_program_relpath_from_gitrepo(
+def _my_save_config_file_from_dict(config_filename, config_dict):
+    s = b"wandb_version: 1"
+    if config_dict:  # adding an empty dictionary here causes a parse error
+        s += b"\n\n" + yaml.dump(
+            config_dict,
+            Dumper=yaml.SafeDumper,
+            default_flow_style=False,
+            allow_unicode=True,
+            encoding="utf-8",
+        )
+    data = s.decode("utf-8")
+    if ".wandb" not in config_filename and "wandb" in config_filename:
+        config_filename = config_filename.replace("wandb", ".wandb", 1)
+        os.environ[wandb.env.SWEEP_PARAM_PATH] = config_filename
+    filesystem._safe_makedirs(os.path.dirname(config_filename))
+    with open(config_filename, "w") as conf_file:
+        conf_file.write(data)
+
+
+# Monkeypatching fn used by wandb.agent for creating the sweep config yaml file. It ignores __stage_dir__ which is
+# where wandb.init stores its files (/path/to/.wandb/). Note that wandb.sweep uses a different __stage_dir__ which
+# needed to be separately set above (very annoying).
+# NOTE: This fn will eventually be moved in wandb.
+wandb.sdk.lib.config_util.save_config_file_from_dict = _my_save_config_file_from_dict
+
+
+def _my_get_program_relpath_from_gitrepo(
     program: str, _logger: Optional[_EarlyLogger] = None
 ) -> Optional[str]:
     repo = wandb.sdk.lib.git.GitRepo()
@@ -69,7 +109,7 @@ def _get_program_relpath_from_gitrepo(
     if not root:
         root = os.getcwd()
     full_path_to_program = os.path.join(
-        root, os.path.relpath(original_cwd, root), program
+        root, os.path.relpath(__original_cwd__, root), program
     )
     if os.path.exists(full_path_to_program):
         relative_path = os.path.relpath(full_path_to_program, start=root)
@@ -87,8 +127,9 @@ def _get_program_relpath_from_gitrepo(
 # Monkeypatching to force wandb to use the original cwd when creating
 # full_path_to_program. Otherwise the hydra cwd would be used, which could
 # be located away from the code directory.
+# Patching out here for same reasons explained in previous patch comment.
 wandb.sdk.wandb_settings._get_program_relpath_from_gitrepo = (
-    _get_program_relpath_from_gitrepo
+    _my_get_program_relpath_from_gitrepo
 )
 
 
@@ -228,6 +269,8 @@ class WandbSweeper(Sweeper):
 
         self.wandb_tags = self.wandb_sweep_config.tags
         self.wandb_notes = self.wandb_sweep_config.notes
+        assert OmegaConf.is_list(self.wandb_tags)
+        assert OmegaConf.is_config(self.wandb_notes)
 
     def setup(
         self,
@@ -238,10 +281,12 @@ class WandbSweeper(Sweeper):
     ) -> None:
         self.config = config
         self.agent_run_count = self.wandb_sweep_config.count
-        self._task_function = functools.partial(
-            self.wandb_task,
-            task_function=task_function,
-            count=self.agent_run_count,
+        self._task_function = lambda task_cfg: (
+            self.wandb_task(
+                base_config=task_cfg,
+                task_function=task_function,
+                count=self.agent_run_count,
+            )
         )
         self.hydra_context = hydra_context
         self.job_idx = 0
@@ -273,8 +318,10 @@ class WandbSweeper(Sweeper):
         if self.wandb_notes:
             self.wandb_notes = str(OmegaConf.to_container(self.wandb_notes))
 
-        self.program = __main__.__file__
-        self.program_relpath = __main__.__file__
+        # For keeping track of original code working directory without resorting to hydra.util get_original_cwd()
+        # since HydraConfig hasn't been instantiated yet (happens after launch, which is too late)
+        self.program = __main_file__
+        self.program_relpath = __main_file__
 
     @property
     def sweep_id(self) -> Any:
@@ -302,18 +349,31 @@ class WandbSweeper(Sweeper):
             else:
                 hydra_overrides.append(override)
 
-        LOGGER.info(
+        logger.info(
             f"WandbSweeper(method={self.wandb_sweep_config.method}, "
             f"num_agents={self.wandb_sweep_config.num_agents}, count={self.wandb_sweep_config.count}, "
             f"entity={self.wandb_sweep_config.entity}, project={self.wandb_sweep_config.project}, "
             f"name={self.wandb_sweep_config.name})"
         )
-        LOGGER.info(f"with parameterization {wandb_params}")
-        LOGGER.info(f"Sweep output dir: {self.config.hydra.sweep.dir}")
+        logger.info(f"with parameterization {wandb_params}")
+        logger.info(f"Sweep output dir: {self.config.hydra.sweep.dir}")
+
+        # Creating this folder early so that wandb.init can write to this location.
+        Path(self.config.hydra.sweep.dir).mkdir(exist_ok=True, parents=False)
+        (Path(self.config.hydra.sweep.dir) / ".wandb").mkdir(
+            exist_ok=True, parents=False
+        )
+
+        # Unfortuately wandb.sweep doesn't pay attn to this since it uses InternalApi which uses the old Settings
+        # class that uses wandb.old.core for retrieving the wandb dir. It has its own __stage_dir__.
+        os.environ["WANDB_DIR"] = self.config.hydra.sweep.dir
 
         wandb_api = InternalApi()
         if not sweep_id:
+            # Need to set PROGRAM env var to original program location since wandb.sweep can't take in a
+            # wandb.Settings object, unlike wandb.init
             os.environ[wandb.env.PROGRAM] = self.program
+
             # Wandb sweep controller will only sweep through
             # params provided by self.sweep_dict
             sweep_id = wandb.sweep(
@@ -321,11 +381,11 @@ class WandbSweeper(Sweeper):
                 entity=self.wandb_sweep_config.entity,
                 project=self.wandb_sweep_config.project,
             )
-            LOGGER.info(
+            logger.info(
                 f"Starting Wandb sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
             )
         else:
-            LOGGER.info(
+            logger.info(
                 f"Reusing Wandb sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
             )
         self._sweep_id = sweep_id
@@ -354,6 +414,7 @@ class WandbSweeper(Sweeper):
 
     def wandb_task(
         self,
+        *,
         base_config: DictConfig,
         task_function: TaskFunction,
         count: Optional[int] = 1,
@@ -362,6 +423,9 @@ class WandbSweeper(Sweeper):
         sweep_dir = Path(runtime_cfg.sweep.dir)
         sweep_subdir = sweep_dir / Path(runtime_cfg.sweep.subdir)
 
+        # Need to set PROGRAM env var to original program location since passing it through wandb_settings doesn't
+        # apply to wandb.agent which checks where the program is located in order to do code-save-related things.
+        # However, with wandb.init we're fine since we pass wandb_settings to it.
         os.environ[wandb.env.PROGRAM] = self.program
         wandb_settings = wandb.Settings(
             start_method="thread",
@@ -370,16 +434,17 @@ class WandbSweeper(Sweeper):
         )
 
         def run() -> Any:
-            LOGGER.info("Agent initializing wandb...")
-            # TODO: allow user to pass in their own notes, tags, and group
-            # TODO: test resuming sweeps and resuming runs
-            # NOTE: wandb's git features won't work if hydra working dir different from code directory
+            logger.info("Agent initializing wandb...")
+            # TODO: test resuming sweeps and resuming runs. Will need to set resume=True after preemption. Can check
+            # via self.config after overriding checkpoint(self, *args: Any, **kwargs: Any) in BaseSubmititLauncher
+            # and providing sweep_overrides = {'hydra.sweeper.wandb_sweep_config.resume': True} to **kwargs
             with wandb.init(
                 name=sweep_subdir.name,
                 group=sweep_dir.name,
                 settings=wandb_settings,
                 notes=self.wandb_notes,
                 tags=self.wandb_tags,
+                dir=str(sweep_dir),
             ) as run:
                 override_dotlist = [
                     f"{dot}={val}" for dot, val in run.config.as_dict().items()
@@ -394,17 +459,17 @@ class WandbSweeper(Sweeper):
                 config_dot_dict = flatten_dict(config_dict)
                 run.config.setdefaults(config_dot_dict)
 
-                LOGGER.info(
+                logger.info(
                     f"Agent initialized with id={run.id}, name={run.name}, "
                     f"config={flatten_dict(run.config.as_dict())} at URL: {run.get_url()}"
                 )
-                LOGGER.info(f"Agent {run.id} executing task function...")
+                logger.info(f"Agent {run.id} executing task function...")
                 ret = task_function(config)
-                LOGGER.info(f"Agent {run.id} finished executing task function")
+                logger.info(f"Agent {run.id} finished executing task function")
                 return ret
 
         if not self.sweep_id:
             raise ValueError(f"sweep_id cannot be {self.sweep_id}")
 
-        LOGGER.info("Launching Wandb agent...")
+        logger.info("Launching Wandb agent...")
         wandb.agent(self.sweep_id, function=run, count=count)
