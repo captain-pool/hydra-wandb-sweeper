@@ -48,15 +48,24 @@ class WandbParameterSpec:
 class WandbConfig:
     name: str
     method: str
+
+    # number of function evaluations to perform per agent
     count: Optional[int] = None
+
     metric: Optional[DictConfig] = DictConfig({})
+
+    # number of agents to launch in a batch until budget is reached
     num_agents: Optional[int] = 1
+
     sweep_id: Optional[str] = None
     entity: Optional[str] = None
     project: Optional[str] = None
     early_terminate: Optional[DictConfig] = DictConfig({})
     tags: Optional[ListConfig] = ListConfig([])
     resume: Optional[bool] = False
+
+    # total number of agents to launch
+    budget: Optional[int] = 1
 
     # Notes can contain a string, a list, or any OmegaConf type (e.g., if you wanted to pass a config value
     # that interoplated into a ListConfig, like ${hydra.overrides.task})

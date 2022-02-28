@@ -353,8 +353,11 @@ class WandbSweeper(Sweeper):
 
         logger.info(
             f"WandbSweeper(method={self.wandb_sweep_config.method}, "
-            f"num_agents={self.wandb_sweep_config.num_agents}, count={self.wandb_sweep_config.count}, "
-            f"entity={self.wandb_sweep_config.entity}, project={self.wandb_sweep_config.project}, "
+            f"num_agents={self.wandb_sweep_config.num_agents}, "
+            f"count={self.wandb_sweep_config.count}, "
+            f"budget={self.wandb_sweep_config.budget}"
+            f"entity={self.wandb_sweep_config.entity}, "
+            f"project={self.wandb_sweep_config.project}, "
             f"name={self.wandb_sweep_config.name})"
         )
         logger.info(f"with parameterization {wandb_params}")
@@ -396,27 +399,34 @@ class WandbSweeper(Sweeper):
             )
         self._sweep_id = sweep_id
 
-        # Repeating hydra overrides to match the number of wandb agents
-        # requested. Each agent will interact with the wandb cloud controller
-        # to receive hyperparams to send to its associated task function.
-        overrides = []
-        for _ in range(self.wandb_sweep_config.num_agents):
-            overrides.append(
-                tuple(
-                    f"{override.get_key_element()}={override.value()}"
-                    for override in hydra_overrides
-                )
-            )
-        self.validate_batch_is_legal(overrides)
+        remaining_budget = self.wandb_sweep_config.budget
+        num_agents = self.wandb_sweep_config.num_agents
+        all_returns: List[Any] = []
+        while remaining_budget > 0:
+            batch = min(num_agents, remaining_budget)
+            remaining_budget -= batch
 
-        # Hydra launcher will launch a wandb agent for each hydra override (which
-        # will contain the base configuration to be overridden by wandb cloud controller)
-        # It's recommended to set hydra.wandb_sweep_config.count to 1 if using the submitit
-        # plugin -> https://docs.wandb.ai/guides/sweeps/faq#how-should-i-run-sweeps-on-slurm
-        # TODO: would be nice to have a budget-based approach and allow repeatedly launching
-        # batches of agents until a budget is reached.
-        returns = self.launcher.launch(overrides, initial_job_idx=self.job_idx)
-        # self.job_idx += len(returns)  # TODO: use for budget approach
+            # Repeating hydra overrides to match the number of wandb agents
+            # requested. Each agent will interact with the wandb cloud controller
+            # to receive hyperparams to send to its associated task function.
+            overrides = []
+            for _ in range(num_agents):
+                overrides.append(
+                    tuple(
+                        f"{override.get_key_element()}={override.value()}"
+                        for override in hydra_overrides
+                    )
+                )
+            self.validate_batch_is_legal(overrides)
+
+            # Hydra launcher will launch a wandb agent for each hydra override (which
+            # will contain the base configuration to be overridden by wandb cloud controller)
+            # It's recommended to set hydra.wandb_sweep_config.count to 1 if using the submitit
+            # plugin -> https://docs.wandb.ai/guides/sweeps/faq#how-should-i-run-sweeps-on-slurm
+            returns = self.launcher.launch(overrides, initial_job_idx=self.job_idx)
+            self.job_idx += len(returns)
+
+            all_returns.extend(returns)
 
     def wandb_task(
         self,
@@ -439,11 +449,14 @@ class WandbSweeper(Sweeper):
             program_relpath=self.program_relpath,
         )
 
+        results: List[Any] = []
+
         def run() -> Any:
             logger.info("Agent initializing wandb...")
             # TODO: test resuming sweeps and resuming runs. Will need to set resume=True after preemption. Can check
             # via self.config after overriding checkpoint(self, *args: Any, **kwargs: Any) in BaseSubmititLauncher
             # and providing sweep_overrides = {'hydra.sweeper.wandb_sweep_config.resume': True} to **kwargs
+            resume = HydraConfig.get().sweeper.wandb_sweep_config.resume
             with wandb.init(
                 name=sweep_subdir.name,
                 group=sweep_dir.name,
@@ -451,6 +464,7 @@ class WandbSweeper(Sweeper):
                 notes=self.wandb_notes,
                 tags=self.wandb_tags,
                 dir=str(sweep_dir),
+                resume=True if resume else None,
             ) as run:
                 override_dotlist = [
                     f"{dot}={val}" for dot, val in run.config.as_dict().items()
@@ -470,12 +484,12 @@ class WandbSweeper(Sweeper):
                     f"config={flatten_dict(run.config.as_dict())} at URL: {run.get_url()}"
                 )
                 logger.info(f"Agent {run.id} executing task function...")
-                ret = task_function(config)
+                results.append(task_function(config))
                 logger.info(f"Agent {run.id} finished executing task function")
-                return ret
 
         if not self.sweep_id:
             raise ValueError(f"sweep_id cannot be {self.sweep_id}")
 
         logger.info("Launching Wandb agent...")
         wandb.agent(self.sweep_id, function=run, count=count)
+        return results

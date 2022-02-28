@@ -10,7 +10,8 @@ hydra:
         name: out
         goal: minimize
       method: bayes
-      num_agents: 2
+      num_agents: 2  # number of agents to launch in a batch until budget is reached
+      budget: 20  # total number of agents to launch
       resume: false
       # entity: your_entity
       project: hydra_plugin_test_project
@@ -24,8 +25,10 @@ hydra:
       #   max_iter: 27  #  the maximum number of iterations.
       #   s: 2  # the total number of brackets
       #   eta: 3  # the bracket multiplier schedule
+      
       # recommended to set to 1 when running in SLURM environment. Each agent only runs one training job then exits.
-      count: 100
+      count: 1  # number of function evaluations to perform per agent
+
       # sweep_id:  # used for resuming from a previous sweep
 
     # parameters are described using dot notation but will be accessible within the task function in typical OmegaConf
