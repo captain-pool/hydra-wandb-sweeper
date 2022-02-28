@@ -19,6 +19,7 @@ from hydra.core.override_parser.types import (
 )
 from hydra.plugins.sweeper import Sweeper
 from hydra.types import HydraContext, TaskFunction
+from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from wandb.apis import InternalApi
 from wandb.sdk.lib import filesystem
@@ -315,8 +316,9 @@ class WandbSweeper(Sweeper):
         self.wandb_tags = (
             OmegaConf.to_container(self.wandb_tags) if self.wandb_tags else None
         )
-        if self.wandb_notes:
-            self.wandb_notes = str(OmegaConf.to_container(self.wandb_notes))
+        self.wandb_notes = (
+            str(OmegaConf.to_container(self.wandb_notes)) if self.wandb_notes else None
+        )
 
         # For keeping track of original code working directory without resorting to hydra.util get_original_cwd()
         # since HydraConfig hasn't been instantiated yet (happens after launch, which is too late)
@@ -356,17 +358,21 @@ class WandbSweeper(Sweeper):
             f"name={self.wandb_sweep_config.name})"
         )
         logger.info(f"with parameterization {wandb_params}")
-        logger.info(f"Sweep output dir: {self.config.hydra.sweep.dir}")
+        logger.info(
+            f"Sweep output dir: {to_absolute_path(self.config.hydra.sweep.dir)}"
+        )
 
         # Creating this folder early so that wandb.init can write to this location.
-        Path(self.config.hydra.sweep.dir).mkdir(exist_ok=True, parents=False)
-        (Path(self.config.hydra.sweep.dir) / ".wandb").mkdir(
+        Path(to_absolute_path(self.config.hydra.sweep.dir)).mkdir(
+            exist_ok=True, parents=True
+        )
+        (Path(to_absolute_path(self.config.hydra.sweep.dir)) / ".wandb").mkdir(
             exist_ok=True, parents=False
         )
 
         # Unfortuately wandb.sweep doesn't pay attn to this since it uses InternalApi which uses the old Settings
         # class that uses wandb.old.core for retrieving the wandb dir. It has its own __stage_dir__.
-        os.environ["WANDB_DIR"] = self.config.hydra.sweep.dir
+        os.environ["WANDB_DIR"] = to_absolute_path(self.config.hydra.sweep.dir)
 
         wandb_api = InternalApi()
         if not sweep_id:
@@ -420,7 +426,7 @@ class WandbSweeper(Sweeper):
         count: Optional[int] = 1,
     ) -> None:
         runtime_cfg = HydraConfig.get()
-        sweep_dir = Path(runtime_cfg.sweep.dir)
+        sweep_dir = Path(to_absolute_path(runtime_cfg.sweep.dir))
         sweep_subdir = sweep_dir / Path(runtime_cfg.sweep.subdir)
 
         # Need to set PROGRAM env var to original program location since passing it through wandb_settings doesn't

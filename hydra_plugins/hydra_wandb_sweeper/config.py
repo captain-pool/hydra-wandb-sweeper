@@ -31,14 +31,14 @@ class WandbParameterSpec:
     # "categorical": ["values"],
     # "int_uniform": ["min", "max"],
     # "uniform": ["min", "max"],
-    # "q_uniform": ["min", "max"],
+    # "q_uniform": ["min", "max", "q"],
     # "log_uniform": ["min", "max"],
-    # "q_log_uniform": ["min", "max"],
+    # "q_log_uniform": ["min", "max", "q"],
     # "inv_log_uniform": ["min", "max"],
     # "normal": ["mu", "sigma"],
-    # "q_normal": ["mu", "sigma"],
+    # "q_normal": ["mu", "sigma", "q"],
     # "log_normal": ["mu", "sigma"],
-    # "q_log_normal": ["mu", "sigma"],
+    # "q_log_normal": ["mu", "sigma", "q"],
     distribution: Optional[str] = None
     value: Optional[float] = None
     values: Optional[MutableSequence] = None

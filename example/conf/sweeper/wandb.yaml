@@ -1,0 +1,56 @@
+# @package _global_
+defaults:
+  - override /hydra/sweeper: wandb
+
+hydra:
+  sweeper:
+    wandb_sweep_config:
+      name: hydra_plugin_test
+      metric:
+        name: out
+        goal: minimize
+      method: bayes
+      num_agents: 2
+      resume: false
+      # entity: your_entity
+      project: hydra_plugin_test_project
+      notes: ${hydra.overrides.task}
+      tags:
+        - ${experiment.name}
+        - ${model.name}
+        - ${experiment.db}
+      # early_terminate:
+      #   type: hyperband
+      #   max_iter: 27  #  the maximum number of iterations.
+      #   s: 2  # the total number of brackets
+      #   eta: 3  # the bracket multiplier schedule
+      # recommended to set to 1 when running in SLURM environment. Each agent only runs one training job then exits.
+      count: 100
+      # sweep_id:  # used for resuming from a previous sweep
+
+    # parameters are described using dot notation but will be accessible within the task function in typical OmegaConf
+    # fashion, e.g., model_param1 = cfg.model.param1
+    params:
+      # categorical, one or the other
+      experiment.db:
+        - mnist
+        - cifar
+
+      # a log-distributed positive scalar, evolving by factors of 2 on average
+      experiment.lr:
+        distribution: q_log_uniform
+        min: 0.02
+        max: 1
+        q: 2.0
+
+      # a linearly-distributed scalar between 0 and 1
+      model.dropout:
+        distribution: uniform
+        min: 0.0
+        max: 1.0
+
+      # a linearly-distributed integer scalar between 4 to 16
+      experiment.batch_size:
+        distribution: int_uniform
+        min: 4
+        max: 16
