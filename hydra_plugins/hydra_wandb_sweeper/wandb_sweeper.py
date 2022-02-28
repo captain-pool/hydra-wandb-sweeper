@@ -17,6 +17,7 @@ from hydra.core.override_parser.types import (
     RangeSweep,
     Transformer,
 )
+from hydra.core.utils import JobStatus
 from hydra.plugins.sweeper import Sweeper
 from hydra.types import HydraContext, TaskFunction
 from hydra.utils import to_absolute_path
@@ -87,8 +88,8 @@ def _my_save_config_file_from_dict(config_filename, config_dict):
             encoding="utf-8",
         )
     data = s.decode("utf-8")
-    if ".wandb" not in config_filename and "wandb" in config_filename:
-        config_filename = config_filename.replace("wandb", ".wandb", 1)
+    if "/.wandb/" not in config_filename and "/wandb/" in config_filename:
+        config_filename = config_filename.replace("/wandb/", "/.wandb/", 1)
         os.environ[wandb.env.SWEEP_PARAM_PATH] = config_filename
     filesystem._safe_makedirs(os.path.dirname(config_filename))
     with open(config_filename, "w") as conf_file:
@@ -355,7 +356,7 @@ class WandbSweeper(Sweeper):
             f"WandbSweeper(method={self.wandb_sweep_config.method}, "
             f"num_agents={self.wandb_sweep_config.num_agents}, "
             f"count={self.wandb_sweep_config.count}, "
-            f"budget={self.wandb_sweep_config.budget}"
+            f"budget={self.wandb_sweep_config.budget}, "
             f"entity={self.wandb_sweep_config.entity}, "
             f"project={self.wandb_sweep_config.project}, "
             f"name={self.wandb_sweep_config.name})"
@@ -391,11 +392,11 @@ class WandbSweeper(Sweeper):
                 project=self.wandb_sweep_config.project,
             )
             logger.info(
-                f"Starting Wandb sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
+                f"Starting Wandb Sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
             )
         else:
             logger.info(
-                f"Reusing Wandb sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
+                f"Reusing Wandb Sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
             )
         self._sweep_id = sweep_id
 
@@ -450,9 +451,10 @@ class WandbSweeper(Sweeper):
         )
 
         results: List[Any] = []
+        statuses: List[JobStatus] = []
 
         def run() -> Any:
-            logger.info("Agent initializing wandb...")
+            logger.info("Agent initializing a Run...")
             # TODO: test resuming sweeps and resuming runs. Will need to set resume=True after preemption. Can check
             # via self.config after overriding checkpoint(self, *args: Any, **kwargs: Any) in BaseSubmititLauncher
             # and providing sweep_overrides = {'hydra.sweeper.wandb_sweep_config.resume': True} to **kwargs
@@ -480,16 +482,41 @@ class WandbSweeper(Sweeper):
                 run.config.setdefaults(config_dot_dict)
 
                 logger.info(
-                    f"Agent initialized with id={run.id}, name={run.name}, "
+                    f"Run initialized with ID: {run.id}, Name: {run.name}, "
                     f"config={flatten_dict(run.config.as_dict())} at URL: {run.get_url()}"
                 )
-                logger.info(f"Agent {run.id} executing task function...")
-                results.append(task_function(config))
-                logger.info(f"Agent {run.id} finished executing task function")
+                # NOTE: would be nice if wandb_agent.py exposed the agent object so I could log the agent ID
+                logger.info(f"Agent executing task function under Run {run.id} ...")
+                try:
+                    result = task_function(config)
+                    results.append(result)
+                    status = JobStatus.COMPLETED
+                    statuses.append(status)
+                except Exception as e:
+                    result = e
+                    results.append(result)
+                    status = JobStatus.FAILED
+                    statuses.append(status)
+                    raise e
+                except:
+                    result = None
+                    results.append(result)
+                    status = JobStatus.UNKNOWN
+                    statuses.append(status)
+                    raise RuntimeError(
+                        f"Unknown error from task function under Run {run.id}"
+                    )
+                finally:
+                    if isinstance(result, Exception):
+                        result = repr(result)
+                    logger.info(
+                        f"Agent finished executing task function under Run {run.id} "
+                        f"with status: {status} and result: {result}"
+                    )
 
         if not self.sweep_id:
             raise ValueError(f"sweep_id cannot be {self.sweep_id}")
 
-        logger.info("Launching Wandb agent...")
+        logger.info("Launching a Wandb Agent...")
         wandb.agent(self.sweep_id, function=run, count=count)
-        return results
+        return {"results": results, "statuses": statuses}
