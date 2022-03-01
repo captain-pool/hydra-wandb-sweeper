@@ -7,7 +7,7 @@ from omegaconf import DictConfig
 logger = logging.getLogger(__name__)
 
 
-@hydra.main(config_path="./conf", config_name="config")
+@hydra.main(config_path="conf", config_name="config")
 def dummy_training(cfg: DictConfig) -> float:
     """A dummy function to minimize
     Minimum is 0.0 at:

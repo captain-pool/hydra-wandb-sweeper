@@ -1,10 +1,9 @@
----
 default_language_version:
   python: python3.8
 repos:
   # Fixing Python Files
   - repo: https://github.com/psf/black
-    rev: 21.12b0
+    rev: 22.1.0
     hooks:
       - id: black
   - repo: https://github.com/PyCQA/isort
@@ -13,7 +12,7 @@ repos:
       - id: isort
         args: [--profile, black]
   - repo: https://github.com/MarcoGorelli/absolufy-imports
-    rev: v0.3.0
+    rev: v0.3.1
     hooks:
       - id: absolufy-imports
   - repo: local
@@ -31,14 +30,19 @@ repos:
       - id: check-yaml
 
   - repo: https://github.com/jumanjihouse/pre-commit-hook-yamlfmt
-    rev: 0.0.11
+    rev: 0.1.0
     hooks:
       - id: yamlfmt
         exclude: example/conf/(logging)
-        args: [--offset, '2', --mapping, '2', --sequence, '4']
+        args: [--offset, '2', --mapping, '2', --sequence, '4', --implicit_start]
 
   - repo: https://github.com/adrienverge/yamllint.git
-    rev: v1.21.0
+    rev: v1.26.3
     hooks:
       - id: yamllint
-        args: [--format, parsable, --strict]
+        args:
+          - --format
+          - parsable
+          - --strict
+          - --config-data
+          - '{extends: default, rules: {document-start: disable}}'

@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, MutableSequence, Optional
 
-from hydra.core import config_store
+from hydra.core.config_store import ConfigStore
 from omegaconf import DictConfig, ListConfig
 
 
@@ -85,6 +85,6 @@ class WandbSweeperConf:
     params: Dict[str, Any] = field(default_factory=dict)
 
 
-config_store.ConfigStore.instance().store(
+ConfigStore.instance().store(
     group="hydra/sweeper", name="wandb", node=WandbSweeperConf, provider="wandb_sweeper"
 )
