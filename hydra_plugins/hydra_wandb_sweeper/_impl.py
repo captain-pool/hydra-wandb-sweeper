@@ -256,7 +256,6 @@ class WandbSweeperImpl(Sweeper):
         self, wandb_sweep_config: WandbConfig, params: Optional[DictConfig]
     ) -> None:
         self.wandb_sweep_config = wandb_sweep_config
-        self._sweep_id = None
         self.params: Dict[str, Any] = {}
 
         # setup wandb params from hydra.sweep.params
@@ -269,10 +268,9 @@ class WandbSweeperImpl(Sweeper):
         self.agent_run_count: Optional[int] = None
         self.job_idx: Optional[int] = None
 
+        self.sweep_id = self.wandb_sweep_config.sweep_id
         self.wandb_tags = self.wandb_sweep_config.tags
         self.wandb_notes = self.wandb_sweep_config.notes
-        assert OmegaConf.is_list(self.wandb_tags)
-        assert OmegaConf.is_config(self.wandb_notes)
 
     def setup(
         self,
@@ -307,28 +305,39 @@ class WandbSweeperImpl(Sweeper):
         metric = self.wandb_sweep_config.metric
 
         if metric:
-            self.sweep_dict.update({"metric": omegaconf.OmegaConf.to_container(metric)})
+            self.sweep_dict.update(
+                {"metric": OmegaConf.to_container(metric, resolve=True)}
+            )
 
         if early_terminate:
             self.sweep_dict.update(
-                {"early_terminate": omegaconf.OmegaConf.to_container(early_terminate)}
+                {
+                    "early_terminate": OmegaConf.to_container(
+                        early_terminate, resolve=True
+                    )
+                }
             )
 
+        self.sweep_id = (
+            OmegaConf.to_container(self.sweep_id, resolve=True)
+            if self.sweep_id
+            else None
+        )
         self.wandb_tags = (
-            OmegaConf.to_container(self.wandb_tags) if self.wandb_tags else None
+            OmegaConf.to_container(self.wandb_tags, resolve=True)
+            if self.wandb_tags
+            else None
         )
         self.wandb_notes = (
-            str(OmegaConf.to_container(self.wandb_notes)) if self.wandb_notes else None
+            str(OmegaConf.to_container(self.wandb_notes, resolve=True))
+            if self.wandb_notes
+            else None
         )
 
         # For keeping track of original code working directory without resorting to hydra.util get_original_cwd()
         # since HydraConfig hasn't been instantiated yet (happens after launch, which is too late)
         self.program = __main_file__
         self.program_relpath = __main_file__
-
-    @property
-    def sweep_id(self) -> Any:
-        return self._sweep_id
 
     def sweep(self, arguments: List[str]) -> None:
         assert self.config is not None
@@ -337,7 +346,6 @@ class WandbSweeperImpl(Sweeper):
 
         parser = overrides_parser.OverridesParser.create()
         parsed = parser.parse_overrides(arguments)
-        sweep_id = self.wandb_sweep_config["sweep_id"]
 
         wandb_params = self.sweep_dict["parameters"]
         hydra_overrides = []
@@ -379,30 +387,36 @@ class WandbSweeperImpl(Sweeper):
         os.environ["WANDB_DIR"] = to_absolute_path(self.config.hydra.sweep.dir)
 
         wandb_api = InternalApi()
-        if not sweep_id:
+        if not self.sweep_id:
             # Need to set PROGRAM env var to original program location since wandb.sweep can't take in a
             # wandb.Settings object, unlike wandb.init
             os.environ[wandb.env.PROGRAM] = self.program
 
             # Wandb sweep controller will only sweep through
             # params provided by self.sweep_dict
-            sweep_id = wandb.sweep(
+            self.sweep_id = wandb.sweep(
                 self.sweep_dict,
                 entity=self.wandb_sweep_config.entity,
                 project=self.wandb_sweep_config.project,
             )
             logger.info(
-                f"Starting Wandb Sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
+                f"Starting Wandb Sweep with ID: {self.sweep_id} at URL: {_get_sweep_url(wandb_api, self.sweep_id)}"
             )
         else:
             logger.info(
-                f"Reusing Wandb Sweep with ID: {sweep_id} at URL: {_get_sweep_url(wandb_api, sweep_id)}"
+                f"Reusing Wandb Sweep with ID: {self.sweep_id} at URL: {_get_sweep_url(wandb_api, self.sweep_id)}"
             )
-        self._sweep_id = sweep_id
+
+        if not self.sweep_id:
+            raise ValueError(
+                f"Sweep with ID: {self.sweep_id} can not be created. "
+                f"Either an invalid sweep_id was passed or the sweep does not exist."
+            )
 
         remaining_budget = self.wandb_sweep_config.budget
         num_agents = self.wandb_sweep_config.num_agents
         all_returns: List[Any] = []
+        # TODO: repeatedly check if sweep still exists and break if it doesn't exist
         while remaining_budget > 0:
             batch = min(num_agents, remaining_budget)
             remaining_budget -= batch
@@ -427,6 +441,62 @@ class WandbSweeperImpl(Sweeper):
             returns = self.launcher.launch(overrides, initial_job_idx=self.job_idx)
             self.job_idx += len(returns)
 
+            # Check job status and wandb run statuses within each job
+            job_failures = 0  # there can be a slim chance that the job fails before the agent is started
+            agent_failures = 0
+            agent_failed_returns = []
+            run_failures = 0
+            failed_runs = []
+            num_runs = 0
+            for ret in returns:
+                if ret.status == JobStatus.COMPLETED:
+                    for r in ret.return_value["run_results"]:
+                        if r["status"] == JobStatus.FAILED:
+                            run_failures += 1
+                            failed_runs.append(r)
+                        num_runs += 1
+                    if ret.return_value["agent_status"] == JobStatus.FAILED:
+                        agent_failures += 1
+                        agent_failed_returns.append(ret.return_value["agent_error"])
+                else:
+                    job_failures += 1
+
+            # Raise if too many jobs in batch have failed (note that these are JobReturn objects)
+            # Reuse max_agent_failure_rate. This is such a rare case so it's not worth exposing to the user for now.
+            if (
+                job_failures / len(returns)
+                > self.wandb_sweep_config.max_agent_failure_rate
+            ):
+                logger.error(
+                    f"{job_failures}/{len(returns)} Jobs failed "
+                    f"with max_failure_rate={self.wandb_sweep_config.max_agent_failure_rate}. "
+                    f"This is not an issue with the Agent but rather an issue elsewhere ¯\_(ツ)_/¯"
+                )
+                for ret in returns:
+                    ret.return_value  # delegate raising to JobReturn, with actual traceback
+
+            # Raise if too many agents in batch have failed
+            if (
+                agent_failures / len(returns)
+                > self.wandb_sweep_config.max_agent_failure_rate
+            ):
+                logger.error(
+                    f"{agent_failures}/{len(returns)} Agents failed "
+                    f"with max_failure_rate={self.wandb_sweep_config.max_agent_failure_rate}. "
+                    f"This can possibly be caused by Sweep {self.sweep_id} not existing anymore."
+                )
+                # bundling agents' errors
+                raise Exception(agent_failed_returns)
+
+            # Raise if too many wandb run failures
+            if run_failures / num_runs > self.wandb_sweep_config.max_run_failure_rate:
+                logger.error(
+                    f"Failed {run_failures} times out of {num_runs} "
+                    f"with max_failure_rate={self.wandb_sweep_config.max_run_failure_rate}"
+                )
+                # may as well include all failed runs in one bundled error
+                raise Exception(failed_runs)
+
             all_returns.extend(returns)
 
     def wandb_task(
@@ -450,8 +520,7 @@ class WandbSweeperImpl(Sweeper):
             program_relpath=self.program_relpath,
         )
 
-        results: List[Any] = []
-        statuses: List[JobStatus] = []
+        run_results: List[Any] = []
 
         def run() -> Any:
             logger.info("Agent initializing a Run...")
@@ -486,37 +555,41 @@ class WandbSweeperImpl(Sweeper):
                     f"config={flatten_dict(run.config.as_dict())} at URL: {run.get_url()}"
                 )
                 # NOTE: would be nice if wandb_agent.py exposed the agent object so I could log the agent ID
-                logger.info(f"Agent executing task function under Run {run.id} ...")
+                logger.info(f"Agent executing task function under Run {run.id}...")
                 try:
-                    result = task_function(config)
-                    results.append(result)
+                    ret = task_function(config)
                     status = JobStatus.COMPLETED
-                    statuses.append(status)
-                except Exception as e:
-                    result = e
-                    results.append(result)
-                    status = JobStatus.FAILED
-                    statuses.append(status)
-                    raise e
-                except:
-                    result = None
-                    results.append(result)
-                    status = JobStatus.UNKNOWN
-                    statuses.append(status)
-                    raise RuntimeError(
-                        f"Unknown error from task function under Run {run.id}"
+                    run_results.append(
+                        {"run_id": run.id, "return_value": ret, "status": status}
                     )
+                except BaseException as e:
+                    ret = e
+                    status = JobStatus.FAILED
+                    run_results.append(
+                        {"run_id": run.id, "return_value": ret, "status": status}
+                    )
+                    raise RuntimeError from e
                 finally:
-                    if isinstance(result, Exception):
-                        result = repr(result)
+                    if isinstance(ret, Exception):
+                        ret = repr(ret)
                     logger.info(
                         f"Agent finished executing task function under Run {run.id} "
-                        f"with status: {status} and result: {result}"
+                        f"with status: {status} and return value: {ret}"
                     )
 
-        if not self.sweep_id:
-            raise ValueError(f"sweep_id cannot be {self.sweep_id}")
-
         logger.info("Launching a Wandb Agent...")
-        wandb.agent(self.sweep_id, function=run, count=count)
-        return {"results": results, "statuses": statuses}
+        try:
+            wandb.agent(self.sweep_id, function=run, count=count)
+            agent_status = JobStatus.COMPLETED
+            agent_error = None
+        # catch any errors that have nothing to do with run(), e.g., sweep not existing anymore
+        # wandb.agent catches errors within run() but throws an error when a sweep_id doesn't exist
+        except BaseException as e:
+            agent_status = JobStatus.FAILED
+            agent_error = e
+        finally:
+            return {
+                "run_results": run_results,
+                "agent_status": agent_status,
+                "agent_error": agent_error,
+            }

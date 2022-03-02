@@ -71,6 +71,12 @@ class WandbConfig:
     # that interoplated into a ListConfig, like ${hydra.overrides.task})
     notes: Optional[Any] = None
 
+    # maximum authorized failure rate for a batch of wandb agents' runs (since each agent can execute >= 1 runs)
+    max_run_failure_rate: float = 0.0
+
+    # maximum authorized failure rate for a batch of wandb agents launched by the launcher
+    max_agent_failure_rate: float = 0.0
+
 
 @dataclass
 class WandbSweeperConf:

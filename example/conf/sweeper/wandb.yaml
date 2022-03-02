@@ -28,7 +28,14 @@ hydra:
       #   eta: 3  # the bracket multiplier schedule
       # Recommended to set to 1 when running in SLURM environment.
       # Each agent only runs one training job then exits.
-      count: 1  # number of function evaluations to perform per agent
+      count: 2  # number of function evaluations to perform per agent
+
+      # maximum authorized failure rate for a batch of wandb agents' runs
+      max_run_failure_rate: 0.5
+
+      # maximum authorized failure rate for a batch of wandb agents launched
+      # by the launcher
+      max_agent_failure_rate: 0.1
 
       # sweep_id:  # used for resuming from a previous sweep
 
