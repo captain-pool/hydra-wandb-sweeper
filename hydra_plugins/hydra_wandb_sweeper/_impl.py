@@ -1,6 +1,8 @@
 import logging
 import os
+from functools import partial
 from pathlib import Path
+from threading import Thread
 from typing import Any, Dict, List, MutableMapping, MutableSequence, Optional, Union
 
 import __main__
@@ -22,6 +24,7 @@ from hydra.plugins.sweeper import Sweeper
 from hydra.types import HydraContext, TaskFunction
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from wandb.agents.pyagent import Agent
 from wandb.apis import InternalApi
 from wandb.sdk.lib import filesystem
 from wandb.sdk.wandb_setup import _EarlyLogger
@@ -281,12 +284,8 @@ class WandbSweeperImpl(Sweeper):
     ) -> None:
         self.config = config
         self.agent_run_count = self.wandb_sweep_config.count
-        self._task_function = lambda task_cfg: (
-            self.wandb_task(
-                base_config=task_cfg,
-                task_function=task_function,
-                count=self.agent_run_count,
-            )
+        self._task_function = self.WandbTask(
+            wandb_sweeper=self, task_function=task_function
         )
         self.hydra_context = hydra_context
         self.job_idx = 0
@@ -354,6 +353,7 @@ class WandbSweeperImpl(Sweeper):
         # from overrides meant for hydra configuration
         for override in parsed:
             if is_wandb_override(override):
+                # Overriding wandb config params with wandb command line args
                 wandb_params[
                     override.get_key_element()
                 ] = create_wandb_param_from_override(override)
@@ -416,7 +416,6 @@ class WandbSweeperImpl(Sweeper):
         remaining_budget = self.wandb_sweep_config.budget
         num_agents = self.wandb_sweep_config.num_agents
         all_returns: List[Any] = []
-        # TODO: repeatedly check if sweep still exists and break if it doesn't exist
         while remaining_budget > 0:
             batch = min(num_agents, remaining_budget)
             remaining_budget -= batch
@@ -445,16 +444,16 @@ class WandbSweeperImpl(Sweeper):
             job_failures = 0  # there can be a slim chance that the job fails before the agent is started
             agent_failures = 0
             agent_failed_returns = []
+            num_runs = 0
             run_failures = 0
             failed_runs = []
-            num_runs = 0
             for ret in returns:
                 if ret.status == JobStatus.COMPLETED:
                     for r in ret.return_value["run_results"]:
                         if r["status"] == JobStatus.FAILED:
                             run_failures += 1
                             failed_runs.append(r)
-                        num_runs += 1
+                    num_runs += sum(ret.return_value["num_runs"].values())
                     if ret.return_value["agent_status"] == JobStatus.FAILED:
                         agent_failures += 1
                         agent_failed_returns.append(ret.return_value["agent_error"])
@@ -470,7 +469,7 @@ class WandbSweeperImpl(Sweeper):
                 logger.error(
                     f"{job_failures}/{len(returns)} Jobs failed "
                     f"with max_failure_rate={self.wandb_sweep_config.max_agent_failure_rate}. "
-                    f"This is not an issue with the Agent but rather an issue elsewhere ¯\_(ツ)_/¯"
+                    f"This is not an issue with the Agent but rather an issue elsewhere..."
                 )
                 for ret in returns:
                     ret.return_value  # delegate raising to JobReturn, with actual traceback
@@ -489,9 +488,11 @@ class WandbSweeperImpl(Sweeper):
                 raise Exception(agent_failed_returns)
 
             # Raise if too many wandb run failures
+            # NOTE: doesn't count runs from requeued agents (due to preemption) since they're run from a separate
+            #       parent processs.
             if run_failures / num_runs > self.wandb_sweep_config.max_run_failure_rate:
                 logger.error(
-                    f"Failed {run_failures} times out of {num_runs} "
+                    f"{run_failures}/{num_runs} Runs failed "
                     f"with max_failure_rate={self.wandb_sweep_config.max_run_failure_rate}"
                 )
                 # may as well include all failed runs in one bundled error
@@ -499,97 +500,180 @@ class WandbSweeperImpl(Sweeper):
 
             all_returns.extend(returns)
 
-    def wandb_task(
-        self,
-        *,
-        base_config: DictConfig,
-        task_function: TaskFunction,
-        count: Optional[int] = 1,
-    ) -> None:
-        runtime_cfg = HydraConfig.get()
-        sweep_dir = Path(to_absolute_path(runtime_cfg.sweep.dir))
-        sweep_subdir = sweep_dir / Path(runtime_cfg.sweep.subdir)
+    class WandbTask(TaskFunction):
+        """
+        Inner class for exposing actual task_function and not the wandb wrapped one. This could be useful in cases
+        such as when needing the launcher to be able to inspect the state of the inner task_function callable during
+        checkpointing (in the case of using the submitit launcher plugin).
+        """
 
-        # Need to set PROGRAM env var to original program location since passing it through wandb_settings doesn't
-        # apply to wandb.agent which checks where the program is located in order to do code-save-related things.
-        # However, with wandb.init we're fine since we pass wandb_settings to it.
-        os.environ[wandb.env.PROGRAM] = self.program
-        wandb_settings = wandb.Settings(
-            start_method="thread",
-            program=self.program,
-            program_relpath=self.program_relpath,
-        )
+        def __init__(
+            self, *, task_function: TaskFunction, wandb_sweeper: Sweeper
+        ) -> None:
+            self.inner_task_function = task_function
+            self.wandb_sweeper = wandb_sweeper
+            self.from_preemption = False
+            self.agent_run_count = self.wandb_sweeper.agent_run_count
+            self.max_num_agents = self.wandb_sweeper.wandb_sweep_config.budget
+            self.max_num_runs = self.agent_run_count * self.max_num_agents
+            self.num_runs = {}
 
-        run_results: List[Any] = []
+        def __call__(self, base_config: DictConfig) -> None:
+            runtime_cfg = HydraConfig.get()
+            sweep_dir = Path(to_absolute_path(runtime_cfg.sweep.dir))
+            sweep_subdir = sweep_dir / Path(runtime_cfg.sweep.subdir)
 
-        def run() -> Any:
-            logger.info("Agent initializing a Run...")
-            # TODO: test resuming sweeps and resuming runs. Will need to set resume=True after preemption. Can check
-            # via self.config after overriding checkpoint(self, *args: Any, **kwargs: Any) in BaseSubmititLauncher
-            # and providing sweep_overrides = {'hydra.sweeper.wandb_sweep_config.resume': True} to **kwargs
-            resume = HydraConfig.get().sweeper.wandb_sweep_config.resume
-            with wandb.init(
-                name=sweep_subdir.name,
-                group=sweep_dir.name,
-                settings=wandb_settings,
-                notes=self.wandb_notes,
-                tags=self.wandb_tags,
-                dir=str(sweep_dir),
-                resume=True if resume else None,
-            ) as run:
-                override_dotlist = [
-                    f"{dot}={val}" for dot, val in run.config.as_dict().items()
-                ]
-                override_config = OmegaConf.from_dotlist(override_dotlist)
-                config = OmegaConf.merge(base_config, override_config)
+            # Need to set PROGRAM env var to original program location since passing it through wandb_settings doesn't
+            # apply to wandb.agent which checks where the program is located in order to do code-save-related things.
+            # However, with wandb.init we're fine since we pass wandb_settings to it.
+            os.environ[wandb.env.PROGRAM] = self.wandb_sweeper.program
+            wandb_settings = wandb.Settings(
+                program=self.wandb_sweeper.program,
+                program_relpath=self.wandb_sweeper.program_relpath,
+                start_method="thread",
+            )
 
-                # update any values not set by sweep (won't update those already configured by sweep)
-                config_dict = OmegaConf.to_container(
-                    config, resolve=True, throw_on_missing=True
-                )
-                config_dot_dict = flatten_dict(config_dict)
-                run.config.setdefaults(config_dot_dict)
+            run_results: List[Any] = []
 
-                logger.info(
-                    f"Run initialized with ID: {run.id}, Name: {run.name}, "
-                    f"config={flatten_dict(run.config.as_dict())} at URL: {run.get_url()}"
-                )
-                # NOTE: would be nice if wandb_agent.py exposed the agent object so I could log the agent ID
-                logger.info(f"Agent executing task function under Run {run.id}...")
-                try:
-                    ret = task_function(config)
-                    status = JobStatus.COMPLETED
-                    run_results.append(
-                        {"run_id": run.id, "return_value": ret, "status": status}
-                    )
-                except BaseException as e:
-                    ret = e
-                    status = JobStatus.FAILED
-                    run_results.append(
-                        {"run_id": run.id, "return_value": ret, "status": status}
-                    )
-                    raise RuntimeError from e
-                finally:
-                    if isinstance(ret, Exception):
-                        ret = repr(ret)
+            def run(agent_id) -> Any:
+                if self.from_preemption:
                     logger.info(
-                        f"Agent finished executing task function under Run {run.id} "
-                        f"with status: {status} and return value: {ret}"
+                        f"Agent {agent_id} initializing a Run after preemption..."
                     )
+                else:
+                    logger.info(f"Agent {agent_id} initializing a Run...")
+                with wandb.init(
+                    name=sweep_subdir.name,
+                    group=sweep_dir.name,
+                    settings=wandb_settings,
+                    notes=self.wandb_sweeper.wandb_notes,
+                    tags=self.wandb_sweeper.wandb_tags,
+                    dir=str(sweep_dir),
+                    resume="allow",
+                ) as run:
+                    self.from_preemption = False
+                    self.num_runs[agent_id] += 1
 
-        logger.info("Launching a Wandb Agent...")
-        try:
-            wandb.agent(self.sweep_id, function=run, count=count)
-            agent_status = JobStatus.COMPLETED
-            agent_error = None
-        # catch any errors that have nothing to do with run(), e.g., sweep not existing anymore
-        # wandb.agent catches errors within run() but throws an error when a sweep_id doesn't exist
-        except BaseException as e:
-            agent_status = JobStatus.FAILED
-            agent_error = e
-        finally:
-            return {
-                "run_results": run_results,
-                "agent_status": agent_status,
-                "agent_error": agent_error,
-            }
+                    # Retrieving params from wandb sweep controller
+                    override_dotlist = [
+                        f"{dot}={val}" for dot, val in run.config.as_dict().items()
+                    ]
+                    override_config = OmegaConf.from_dotlist(override_dotlist)
+
+                    # Merging base configuration with wandb sweep configs, overwriting base_config params with
+                    # override_config params when there are matches (overwrite priority goes right-to-left)
+                    config = OmegaConf.merge(base_config, override_config)
+
+                    # Converting to Omegaconf, resolving, then converting from a nested dict to a flat dict
+                    # with keys that are dot-delimited so that it matches the same dot-delimited param format that
+                    # wandb's sweep controller received during creation
+                    config_dict = OmegaConf.to_container(
+                        config, resolve=True, throw_on_missing=True
+                    )
+                    config_dot_dict = flatten_dict(config_dict)
+
+                    # Updating wandb run's param defaults with the dot-delimited params made above. The dict
+                    # above includes params already set by wandb's sweep controller, so setdefaults won't overwrite
+                    # those params and will only update params not configured by the sweep controller. This is so
+                    # we can see all config params, including hydra params, in the wandb web interface.
+                    run.config.setdefaults(config_dot_dict)
+
+                    logger.info(
+                        f"Agent {agent_id} initialized Run with ID: {run.id}, Name: {run.name}, "
+                        f"Config: {flatten_dict(run.config.as_dict())} at URL: {run.get_url()}"
+                    )
+                    # NOTE: would be nice if wandb_agent.py exposed the agent object so I could log the agent ID
+                    # TODO: catch RuntimeError('CUDA out of memory....) and tell wandb to mark the run as having
+                    #       infinite loss so that it knows not to avoid those choice of params next time.
+                    logger.info(
+                        f"Agent {agent_id} executing task function under Run {run.id} ({run.name})..."
+                    )
+                    try:
+                        ret = self.inner_task_function(config)
+                        status = JobStatus.COMPLETED
+                        run_results.append(
+                            {
+                                "run_id": run.id,
+                                "name": run.name,
+                                "return_value": ret,
+                                "status": status,
+                            }
+                        )
+                    except Exception as e:
+                        ret = e
+                        status = JobStatus.FAILED
+                        run_results.append(
+                            {
+                                "run_id": run.id,
+                                "name": run.name,
+                                "return_value": ret,
+                                "status": status,
+                            }
+                        )
+                        raise e
+                    # Catching any system exits from the task function so that we could inspect why the exit happened
+                    # and pass a JobStatus and other useful info to the launcher pertaining to the exit. i.e.,
+                    # don't stop everything just because a task function exited, just passively send the info to the
+                    # launcher.
+                    except SystemExit as e:
+                        ret = e
+                        if e.code == 0 or e.code is None:
+                            status = JobStatus.COMPLETED
+                        else:
+                            status = JobStatus.FAILED
+                        run_results.append(
+                            {
+                                "run_id": run.id,
+                                "name": run.name,
+                                "return_value": ret,
+                                "status": status,
+                            }
+                        )
+                    finally:
+                        if isinstance(ret, BaseException):
+                            ret = repr(ret)
+                        logger.info(
+                            f"Agent finished executing task function under Run {run.id} ({run.name}) "
+                            f"with status: {status} and return value: {ret}"
+                        )
+
+            def agent_run(agent):
+                agent._heartbeat_thread = Thread(target=agent._heartbeat)
+                agent._heartbeat_thread.daemon = True
+                agent._heartbeat_thread.start()
+                agent._run_jobs_from_queue()
+
+            try:
+                num_runs_so_far = sum(self.num_runs.values())
+                if num_runs_so_far <= self.max_num_runs:
+                    agent = Agent(
+                        self.wandb_sweeper.sweep_id, count=self.agent_run_count
+                    )
+                    agent._setup()
+                    agent_id = str(agent._agent_id)
+                    self.num_runs[agent_id] = 0
+                    agent._function = partial(run, agent_id)
+                    logger.info(f"Launching a Wandb Agent with ID: {agent_id}...")
+                    agent_run(agent)
+                agent_status = JobStatus.COMPLETED
+                agent_error = None
+            # Catch any errors that have nothing to do with run(), e.g., sweep not existing anymore
+            # wandb.agent catches errors within run() but throws an error when a sweep_id doesn't exist
+            except Exception as e:
+                agent_status = JobStatus.FAILED
+                agent_error = e
+            # Catching system exits that are performed on the outer task function
+            except SystemExit as e:
+                agent_error = e
+                if e.code == 0 or e.code is None or e.code == -1:
+                    agent_status = JobStatus.COMPLETED
+                else:
+                    agent_status = JobStatus.FAILED
+            finally:
+                return {
+                    "agent_id": agent_id,
+                    "run_results": run_results,
+                    "agent_status": agent_status,
+                    "agent_error": agent_error,
+                    "num_runs": self.num_runs,
+                }

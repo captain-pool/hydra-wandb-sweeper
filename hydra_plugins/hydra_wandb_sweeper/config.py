@@ -46,8 +46,8 @@ class WandbParameterSpec:
 
 @dataclass
 class WandbConfig:
-    name: str
-    method: str
+    name: str = "hydra_wandb_sweep"
+    method: str = "bayes"
 
     # number of function evaluations to perform per agent
     count: Optional[int] = None
@@ -62,7 +62,6 @@ class WandbConfig:
     project: Optional[str] = None
     early_terminate: Optional[DictConfig] = DictConfig({})
     tags: Optional[ListConfig] = ListConfig([])
-    resume: Optional[bool] = False
 
     # total number of agents to launch
     budget: Optional[int] = 1
@@ -80,7 +79,7 @@ class WandbConfig:
 
 @dataclass
 class WandbSweeperConf:
-    wandb_sweep_config: WandbConfig
+    wandb_sweep_config: WandbConfig = WandbConfig()
     _target_: str = "hydra_plugins.hydra_wandb_sweeper.wandb_sweeper.WandbSweeper"
 
     # default parametrization of the search space
