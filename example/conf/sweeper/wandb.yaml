@@ -20,21 +20,23 @@ hydra:
         - ${experiment.name}
         - ${model.name}
         - ${experiment.db}
-      # early_terminate:
-      #   type: hyperband
-      #   max_iter: 27  #  the maximum number of iterations.
-      #   s: 2  # the total number of brackets
-      #   eta: 3  # the bracket multiplier schedule
+      early_terminate:
+        type: hyperband
+        min_iter: 3
+        # max_iter: 27  #  the maximum number of iterations.
+        # s: 2  # the total number of brackets (required for max_iter)
+        eta: 3  # the bracket multiplier schedule
+
       # Recommended to set to 1 when running in SLURM environment.
       # Each agent only runs one training job then exits.
       count: 3  # number of function evaluations to perform per agent
 
       # maximum authorized failure rate for a batch of wandb agents' runs
-      max_run_failure_rate: 0.0
+      max_run_failure_rate: 0.3
 
       # maximum authorized failure rate for a batch of wandb agents launched
       # by the launcher
-      max_agent_failure_rate: 0.0
+      max_agent_failure_rate: 0.1
 
       # sweep_id:  # used for resuming from a previous sweep
 

@@ -24,7 +24,7 @@ from hydra.plugins.sweeper import Sweeper
 from hydra.types import HydraContext, TaskFunction
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, ListConfig, OmegaConf
-from wandb.agents.pyagent import Agent
+from wandb.agents.pyagent import Agent, RunStatus
 from wandb.apis import InternalApi
 from wandb.sdk.lib import filesystem
 from wandb.sdk.wandb_setup import _EarlyLogger
@@ -442,8 +442,10 @@ class WandbSweeperImpl(Sweeper):
 
             # Check job status and wandb run statuses within each job
             job_failures = 0  # there can be a slim chance that the job fails before the agent is started
-            agent_failures = 0
-            agent_failed_returns = []
+            num_unexpected_agent_errors = 0
+            num_expected_agent_errors = 0
+            unexpected_agent_errors = []
+            expected_agent_errors = []
             num_runs = 0
             run_failures = 0
             failed_runs = []
@@ -454,9 +456,18 @@ class WandbSweeperImpl(Sweeper):
                             run_failures += 1
                             failed_runs.append(r)
                     num_runs += sum(ret.return_value["num_runs"].values())
+
+                    # Rare unexpected agent failures
                     if ret.return_value["agent_status"] == JobStatus.FAILED:
-                        agent_failures += 1
-                        agent_failed_returns.append(ret.return_value["agent_error"])
+                        num_unexpected_agent_errors += 1
+                        unexpected_agent_errors.append(ret.return_value["agent_error"])
+                    elif (
+                        ret.return_value["agent_status"] == JobStatus.COMPLETED
+                        and ret.return_value["agent_status"] is not None
+                    ):
+                        num_expected_agent_errors += 1
+                        # e.g., when a sweep was killed
+                        expected_agent_errors.append(ret.return_value["agent_error"])
                 else:
                     job_failures += 1
 
@@ -474,29 +485,45 @@ class WandbSweeperImpl(Sweeper):
                 for ret in returns:
                     ret.return_value  # delegate raising to JobReturn, with actual traceback
 
-            # Raise if too many agents in batch have failed
+            # Raise if too many agents in batch have unexpectedly failed
             if (
-                agent_failures / len(returns)
+                num_unexpected_agent_errors / len(returns)
                 > self.wandb_sweep_config.max_agent_failure_rate
             ):
                 logger.error(
-                    f"{agent_failures}/{len(returns)} Agents failed "
+                    f"{num_unexpected_agent_errors}/{len(returns)} Agents failed "
                     f"with max_failure_rate={self.wandb_sweep_config.max_agent_failure_rate}. "
                     f"This can possibly be caused by Sweep {self.sweep_id} not existing anymore."
                 )
                 # bundling agents' errors
-                raise Exception(agent_failed_returns)
+                raise Exception(unexpected_agent_errors)
 
             # Raise if too many wandb run failures
             # NOTE: doesn't count runs from requeued agents (due to preemption) since they're run from a separate
             #       parent processs.
-            if run_failures / num_runs > self.wandb_sweep_config.max_run_failure_rate:
+            if (
+                num_runs > 0
+                and run_failures / num_runs
+                > self.wandb_sweep_config.max_run_failure_rate
+            ):
                 logger.error(
                     f"{run_failures}/{num_runs} Runs failed "
                     f"with max_failure_rate={self.wandb_sweep_config.max_run_failure_rate}"
                 )
                 # may as well include all failed runs in one bundled error
                 raise Exception(failed_runs)
+
+            if any(
+                [
+                    "Sweep has been killed." in e
+                    for e in expected_agent_errors
+                    if isinstance(e, str)
+                ]
+            ):
+                logger.info(
+                    f"Sweep {self.sweep_id} has been killed. Ending Hydra sweep."
+                )
+                break
 
             all_returns.extend(returns)
 
@@ -535,7 +562,7 @@ class WandbSweeperImpl(Sweeper):
 
             run_results: List[Any] = []
 
-            def run(agent_id) -> Any:
+            def run(agent_id, run_status) -> Any:
                 if self.from_preemption:
                     logger.info(
                         f"Agent {agent_id} initializing a Run after preemption..."
@@ -549,7 +576,7 @@ class WandbSweeperImpl(Sweeper):
                     notes=self.wandb_sweeper.wandb_notes,
                     tags=self.wandb_sweeper.wandb_tags,
                     dir=str(sweep_dir),
-                    resume="allow",
+                    resume=True if self.from_preemption else None,
                 ) as run:
                     self.from_preemption = False
                     self.num_runs[agent_id] += 1
@@ -582,7 +609,7 @@ class WandbSweeperImpl(Sweeper):
                         f"Agent {agent_id} initialized Run with ID: {run.id}, Name: {run.name}, "
                         f"Config: {flatten_dict(run.config.as_dict())} at URL: {run.get_url()}"
                     )
-                    # NOTE: would be nice if wandb_agent.py exposed the agent object so I could log the agent ID
+
                     # TODO: catch RuntimeError('CUDA out of memory....) and tell wandb to mark the run as having
                     #       infinite loss so that it knows not to avoid those choice of params next time.
                     logger.info(
@@ -600,8 +627,12 @@ class WandbSweeperImpl(Sweeper):
                             }
                         )
                     except Exception as e:
-                        ret = e
-                        status = JobStatus.FAILED
+                        if run_status[run.id] == RunStatus.STOPPED:
+                            ret = "Run has been stopped by sweep controller"
+                            status = JobStatus.COMPLETED
+                        else:
+                            ret = e
+                            status = JobStatus.FAILED
                         run_results.append(
                             {
                                 "run_id": run.id,
@@ -610,7 +641,6 @@ class WandbSweeperImpl(Sweeper):
                                 "status": status,
                             }
                         )
-                        raise e
                     # Catching any system exits from the task function so that we could inspect why the exit happened
                     # and pass a JobStatus and other useful info to the launcher pertaining to the exit. i.e.,
                     # don't stop everything just because a task function exited, just passively send the info to the
@@ -644,25 +674,34 @@ class WandbSweeperImpl(Sweeper):
                 agent._run_jobs_from_queue()
 
             try:
+                agent_status = JobStatus.COMPLETED
+                agent_error = None
                 num_runs_so_far = sum(self.num_runs.values())
                 if num_runs_so_far <= self.max_num_runs:
                     agent = Agent(
                         self.wandb_sweeper.sweep_id, count=self.agent_run_count
                     )
-                    agent._setup()
-                    agent_id = str(agent._agent_id)
-                    self.num_runs[agent_id] = 0
-                    agent._function = partial(run, agent_id)
-                    logger.info(f"Launching a Wandb Agent with ID: {agent_id}...")
-                    agent_run(agent)
-                agent_status = JobStatus.COMPLETED
-                agent_error = None
-            # Catch any errors that have nothing to do with run(), e.g., sweep not existing anymore
-            # wandb.agent catches errors within run() but throws an error when a sweep_id doesn't exist
+                    try:
+                        agent._setup()
+                    except Exception as e:
+                        agent_id = None
+                        agent_error = "Sweep has been killed."
+                        agent_status = JobStatus.COMPLETED
+                    else:
+                        agent_id = str(agent._agent_id)
+                        self.num_runs[agent_id] = 0
+                        agent._function = partial(run, agent_id, agent._run_status)
+                        logger.info(f"Launching a Wandb Agent with ID: {agent_id}...")
+                        agent_run(agent)  # <--- main task function loop
+            # Catch unexpected exceptions pertaining to the agent execution and give a FAILED
+            # JobStatus. Expected exceptions, on the other hand, include sweep being killed,
+            # runs being stopped, etc. and give a COMPLETED JobStatus.
             except Exception as e:
                 agent_status = JobStatus.FAILED
                 agent_error = e
             # Catching system exits that are performed on the outer task function
+            # (i.e., this function, __call__). This can potentially come from the checkpoint
+            # function in the submitit launcher.
             except SystemExit as e:
                 agent_error = e
                 if e.code == 0 or e.code is None or e.code == -1:

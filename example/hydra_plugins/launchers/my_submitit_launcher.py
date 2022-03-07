@@ -23,6 +23,13 @@ class MyBaseSubmititLauncher(BaseSubmititLauncher):
         """This method is a modified version of the BaseSubmititLauncher.checkpoint method"""
         run = wandb.run
 
+        while not self.task_function.inner_task_function.__self__.ready_to_checkpoint:
+            logger.info(
+                f"Task function has been pre-empted or timed out. Waiting for it to be ready to be "
+                "checkpointed..."
+            )
+            sleep(5)
+
         if run is not None:
             logger.info(
                 f"Agent has either been pre-empted or timed-out during execution of Run {run.id} ({run.name})."
