@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, MutableSequence, Optional
 
 from hydra.core.config_store import ConfigStore
-from omegaconf import DictConfig, ListConfig
+from omegaconf import MISSING, DictConfig, ListConfig
 
 
 @dataclass
@@ -46,34 +46,50 @@ class WandbParameterSpec:
 
 @dataclass
 class WandbConfig:
-    name: str = "hydra_wandb_sweep"
-    method: str = "bayes"
+    # (Required) The name of the sweep, displayed in the W&B UI.
+    name: str = MISSING
 
-    # number of function evaluations to perform per agent
-    count: Optional[int] = None
+    # (Required) The hyperparam sweep search strategy.
+    method: str = MISSING
 
+    # Number of function evaluations to perform per agent
+    count: Optional[int] = 1
+
+    # Specify the metric to optimize (only used by certain search strategies and stopping criteria).
     metric: Optional[DictConfig] = DictConfig({})
 
-    # number of agents to launch in a batch until budget is reached
+    # Number of agents to launch in a batch until budget is reached
     num_agents: Optional[int] = 1
 
+    # Can provide a sweep ID from a pre-existing sweep if you wanted to continue from it
     sweep_id: Optional[str] = None
+
+    # The entity for this sweep. Otherwise infer from the environment.
     entity: Optional[str] = None
+
+    # Specify the project this sweep will be under. Projects are used to
+    # organize models that can be compared, working on the same problem
+    # with different architectures, hyperparameters, datasets, preprocessing etc.
     project: Optional[str] = None
+
+    # Wandb early termination. Check wandb.yaml in /example for an example config
     early_terminate: Optional[DictConfig] = DictConfig({})
+
+    # Tags can be used to label runs from an agent with particular features, such as
+    # the runs being pre-emptible. It's all up to the user to fill this out.
     tags: Optional[ListConfig] = ListConfig([])
 
-    # total number of agents to launch
+    # Total number of agents to launch
     budget: Optional[int] = 1
 
     # Notes can contain a string, a list, or any OmegaConf type (e.g., if you wanted to pass a config value
     # that interoplated into a ListConfig, like ${hydra.overrides.task})
     notes: Optional[Any] = None
 
-    # maximum authorized failure rate for a batch of wandb agents' runs (since each agent can execute >= 1 runs)
+    # Maximum authorized failure rate for a batch of wandb agents' runs (since each agent can execute >= 1 runs)
     max_run_failure_rate: float = 0.0
 
-    # maximum authorized failure rate for a batch of wandb agents launched by the launcher
+    # Maximum authorized failure rate for a batch of wandb agents launched by the launcher
     max_agent_failure_rate: float = 0.0
 
 
@@ -82,8 +98,7 @@ class WandbSweeperConf:
     wandb_sweep_config: WandbConfig = WandbConfig()
     _target_: str = "hydra_plugins.hydra_wandb_sweeper.wandb_sweeper.WandbSweeper"
 
-    # default parametrization of the search space
-    # can be specified:
+    # Parametrization of the wandb sweep search space can be specified:
     # - as a string, like commandline arguments
     # - as a list, for categorical variables
     # - as a full scalar specification

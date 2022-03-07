@@ -28,7 +28,7 @@ class MyBaseSubmititLauncher(BaseSubmititLauncher):
                 f"Task function has been pre-empted or timed out. Waiting for it to be ready to be "
                 "checkpointed..."
             )
-            sleep(5)
+            sleep(1)
 
         if run is not None:
             logger.info(

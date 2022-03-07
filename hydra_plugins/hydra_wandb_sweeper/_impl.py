@@ -531,7 +531,7 @@ class WandbSweeperImpl(Sweeper):
         """
         Inner class for exposing actual task_function and not the wandb wrapped one. This could be useful in cases
         such as when needing the launcher to be able to inspect the state of the inner task_function callable during
-        checkpointing (in the case of using the submitit launcher plugin).
+        checkpointing (in the case of using the submitit launcher plugin, for example).
         """
 
         def __init__(

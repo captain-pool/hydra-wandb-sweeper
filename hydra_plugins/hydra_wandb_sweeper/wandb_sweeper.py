@@ -1,3 +1,4 @@
+from importlib import import_module
 from typing import List, Optional
 
 from hydra import TaskFunction
@@ -12,9 +13,9 @@ class WandbSweeper(Sweeper):
     """Class to interface with Wandb"""
 
     def __init__(self, wandb_sweep_config: WandbConfig, params: Optional[DictConfig]):
-        from hydra_plugins.hydra_wandb_sweeper._impl import WandbSweeperImpl
+        _impl = import_module("hydra_plugins.hydra_wandb_sweeper._impl")
 
-        self.sweeper = WandbSweeperImpl(wandb_sweep_config, params)
+        self.sweeper = _impl.WandbSweeperImpl(wandb_sweep_config, params)
 
     def setup(
         self,

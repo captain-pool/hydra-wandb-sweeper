@@ -33,7 +33,6 @@ repos:
     rev: 0.1.0
     hooks:
       - id: yamlfmt
-        exclude: example/conf/(logging)
         args: [--offset, '2', --mapping, '2', --sequence, '4', --implicit_start]
 
   - repo: https://github.com/adrienverge/yamllint.git

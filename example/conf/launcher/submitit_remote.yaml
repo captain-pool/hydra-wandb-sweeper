@@ -3,6 +3,12 @@ defaults:
   # Hydra's launcher API is synchronous and not async
   # https://github.com/facebookresearch/hydra/issues/1377#issuecomment-773583397
   # so all jobs in a batch must finish before launching next batch
+  #
+  # Refer to https://hydra.cc/docs/plugins/submitit_launcher/ and
+  # https://github.com/facebookincubator/submitit/blob/main/docs/examples.md
+  # for more information.
+  #
+  # Use submitit_local for local multiprocessing
   - override /hydra/launcher: submitit_slurm
 
 hydra:
@@ -13,7 +19,7 @@ hydra:
     timeout_min: 60
     # partition: main  # place your SLURM partition here
     cpus_per_task: 2  # task = process, cpus = threads if hyperthreading enabled
-    # gres: gpu:rtx8000:1
+    # gres: gpu:rtx8000:1  # place your SLURM gres config here
     nodes: 1
 
     # num of tasks to spawn in each node (will repeat each task in a job array

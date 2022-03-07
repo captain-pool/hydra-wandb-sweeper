@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class DummyTraining(TaskFunction):
     def __init__(self) -> None:
-        self.ready_to_checkpoint = False
+        self.ready_to_checkpoint = True
 
     def __call__(self, cfg: DictConfig) -> float:
         """
@@ -73,31 +73,25 @@ class DummyTraining(TaskFunction):
             # Simulate a bunch of important computations needed before saving whatever
             # you want to save, like model parameters.
             # NOTE: Optional. Uncomment this if you want to further test out pre-emption.
-            # sleep(30)
+            # sleep(5)
 
             # This is to signal that when pre-emption happens, wait until all important computations
             # are finished before finishing execution of checkpoint function.
             self.ready_to_checkpoint = True
+
+            # Simulate unimportant computations before starting next iteration.
+            # NOTE: Optional. Uncomment this if you want to further test out
+            # pre-emption ready_to_checkpoint might not be True for long enough
+            # for the custom submitit checkpoint to catch it mid-run and send a
+            # wandb alert.
+            # sleep(3)
 
         logger.info(
             f"best dummy_training(dropout={dropout:.3f}, lr={lr:.3f}, db={database}, batch_size={batch_size}) "
             f"= {best:.3f}"
         )
 
-        if cfg.error:
-            raise RuntimeError("cfg.error is True")
-
-        if cfg.return_type == "float":
-            return best
-
-        if cfg.return_type == "dict":
-            return dict(name="objective", type="objective", value=best)
-
-        if cfg.return_type == "list":
-            return [dict(name="objective", type="objective", value=best)]
-
-        if cfg.return_type == "none":
-            return None
+        return best
 
 
 if __name__ == "__main__":
