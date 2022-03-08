@@ -1,12 +1,12 @@
 import logging
 import os
 from functools import partial
+from inspect import isclass
 from pathlib import Path
 from threading import Thread
 from typing import Any, Dict, List, MutableMapping, MutableSequence, Optional, Union
 
 import __main__
-import omegaconf
 import wandb
 import yaml
 from hydra.core import plugins
@@ -51,6 +51,26 @@ SUPPORTED_DISTRIBUTIONS = {
     "q_log_normal": ["mu", "sigma", "q"],
 }
 
+SUPPORTED_SEARCH_METHODS_AND_CONSTRAINTS = {
+    "grid": ["value", "values"],
+    "random": ["distribution"],
+    "bayes": ["distribution"],
+}
+
+SUPPORTED_METRIC_ARGS = {
+    "name": [str],
+    "goal": ["minimize", "maximize"],
+    "target": [float],
+}
+
+SUPPORTED_EARLY_TERM_ARGS = {
+    "type": ["hyperband"],
+    "min_iter": [int],
+    "max_iter": [int],
+    "s": [int],
+    "eta": [int],
+}
+
 
 __original_cwd__ = os.getcwd()
 __main_file__ = __main__.__file__
@@ -60,6 +80,10 @@ __main_file__ = __main__.__file__
 # order to create it for eventually saving the sweep config yaml to. If it's not set it defaults
 # to 'wandb' + os.sep
 wandb.old.core._set_stage_dir(".wandb" + os.sep)
+
+"""
+Wandb monkeypatches.
+"""
 
 
 def _my_gitrepo_init(self, root=None, remote="origin", lazy=True):
@@ -138,6 +162,11 @@ wandb.sdk.wandb_settings._get_program_relpath_from_gitrepo = (
 )
 
 
+"""
+Sweeper helper functions.
+"""
+
+
 def is_wandb_override(override: Override) -> bool:
     if (
         override.is_delete()
@@ -151,64 +180,105 @@ def is_wandb_override(override: Override) -> bool:
 
 
 def get_parameter(distribution, *args) -> Dict[str, Any]:
-    keys = SUPPORTED_DISTRIBUTIONS[distribution]
-    parameter = {"distribution": distribution}
-    for key, value in zip(keys, args):
-        if value is None:
-            raise TypeError(f"{key} must be assigned a value.")
-        if distribution not in ("constant", "categorical"):
-            if (key == "min" or key == "max") and "int" in distribution:
-                if not isinstance(value, int):
-                    raise TypeError(f"{value} assigned to {key} must be an integer.")
-            else:
-                value = float(value)
-        if distribution in "constant" and isinstance(value, MutableSequence):
-            assert len(value) == 1
-            value = value[0]
-        if isinstance(value, ListConfig):
-            value = OmegaConf.to_container(value, resolve=True)
-        parameter[key] = value
-    return parameter
+    if distribution is not None:
+        keys = SUPPORTED_DISTRIBUTIONS[distribution]
+        parameter = {"distribution": distribution}
+        for key, value in zip(keys, args):
+            if value is None:
+                raise TypeError(f"{key} must be assigned a value.")
+            if distribution not in ("constant", "categorical"):
+                if (key == "min" or key == "max") and "int" in distribution:
+                    if not isinstance(value, int):
+                        raise TypeError(
+                            f"{value} assigned to {key} must be an integer."
+                        )
+                else:
+                    value = float(value)
+            if distribution in "constant" and isinstance(value, MutableSequence):
+                assert len(value) == 1
+                value = value[0]
+            if isinstance(value, ListConfig):
+                value = OmegaConf.to_container(value, resolve=True)
+            parameter[key] = value
+        return parameter
+    else:
+        parameter = {}
+        for arg in args:
+            if arg is None:
+                raise TypeError("NoneType not accepted as a value.")
+            if isinstance(arg, ListConfig):
+                arg = OmegaConf.to_container(arg, resolve=True)
+            if isinstance(arg, MutableSequence):
+                assert len(arg) > 0
+                if len(arg) == 1:
+                    parameter["value"] = arg[0]
+                if len(arg) > 1:
+                    parameter["values"] = arg
+                return parameter
+            parameter["value"] = arg
+            return parameter
 
 
 def create_wandb_param_from_config(
-    config: Union[MutableSequence[Any], MutableMapping[str, Any]]
+    config: Union[MutableSequence[Any], MutableMapping[str, Any]], method: str
 ) -> Any:
     if isinstance(config, MutableSequence):
         if isinstance(config, ListConfig):
             config = OmegaConf.to_container(config, resolve=True)
         assert len(config) > 0
-        distribution = "constant" if len(config) == 1 else "categorical"
+        if "distribution" in SUPPORTED_SEARCH_METHODS_AND_CONSTRAINTS[method]:
+            distribution = "constant" if len(config) == 1 else "categorical"
+        else:
+            distribution = None
         return get_parameter(distribution, config)
     if isinstance(config, MutableMapping):
         specs = WandbParameterSpec(**config)
-        distribution = specs.distribution
-        if distribution not in SUPPORTED_DISTRIBUTIONS:
-            raise ValueError(
-                f"{distribution} not supported. "
-                f"Supported Distributions: {list(SUPPORTED_DISTRIBUTIONS.keys())}"
-            )
-        supported_params = SUPPORTED_DISTRIBUTIONS[distribution]
-        init_params = [getattr(specs, p) for p in supported_params]
-        param = get_parameter(specs.distribution, *init_params)
+        if "distribution" in SUPPORTED_SEARCH_METHODS_AND_CONSTRAINTS[method]:
+            distribution = specs.distribution
+        else:
+            distribution = None
+        if distribution is not None:
+            if distribution not in SUPPORTED_DISTRIBUTIONS:
+                raise ValueError(
+                    f"{distribution} not supported. "
+                    f"Supported distributions: {list(SUPPORTED_DISTRIBUTIONS.keys())}"
+                )
+            supported_params = SUPPORTED_DISTRIBUTIONS[distribution]
+            init_params = [getattr(specs, p) for p in supported_params]
+        else:
+            supported_params = SUPPORTED_SEARCH_METHODS_AND_CONSTRAINTS[method]
+            init_params = [getattr(specs, p) for p in supported_params]
+            if all(init_params):
+                raise ValueError(
+                    f"Only one of the supported constraint types must be provided: {supported_params}"
+                )
+            init_params = [param for param in init_params if param is not None]
+        param = get_parameter(distribution, *init_params)
         return param
-    param = get_parameter("constant", config)
+    if "distribution" in SUPPORTED_SEARCH_METHODS_AND_CONSTRAINTS[method]:
+        param = get_parameter("constant", config)
+    else:
+        param = get_parameter(None, config)
     return param
 
 
-def create_wandb_param_from_override(override: Override) -> Any:
+def create_wandb_param_from_override(override: Override, method: str) -> Any:
     value = override.value()
     distribution = None
     if getattr(value, "tags", None):
-        assert len(value.tags) == 1  # TODO: support 'grid' search method, i.e., no tags
+        assert len(value.tags) == 1
         distribution = list(value.tags)[0]
         if distribution not in SUPPORTED_DISTRIBUTIONS:
             raise ValueError(
                 f"{distribution} not supported. "
-                f"Supported Distributions: {list(SUPPORTED_DISTRIBUTIONS.keys())}"
+                f"Supported distributions: {list(SUPPORTED_DISTRIBUTIONS.keys())}"
             )
     if not override.is_sweep_override():
-        return value
+        if "distribution" in SUPPORTED_SEARCH_METHODS_AND_CONSTRAINTS[method]:
+            param = get_parameter("constant", value)
+        else:
+            param = get_parameter(None, value)
+        return param
     if override.is_interval_sweep():
         assert isinstance(value, IntervalSweep)
         distribution = distribution or "uniform"
@@ -234,6 +304,67 @@ def create_wandb_param_from_override(override: Override) -> Any:
         return get_parameter(distribution, value.start, value.end, value.step)
 
     raise NotImplementedError(f"{override} not supported by WandB sweeper")
+
+
+def validate_metric(metric_dict):
+    for key, val in metric_dict.items():
+        if key not in SUPPORTED_METRIC_ARGS:
+            raise KeyError(
+                f"metric key {key} must be in supported keys: {list(SUPPORTED_METRIC_ARGS.keys())}."
+            )
+        supported = 0
+        for supported_val in SUPPORTED_METRIC_ARGS[key]:
+            if isclass(supported_val) and isinstance(val, supported_val):
+                supported += 1
+            elif not isclass(supported_val) and val == supported_val:
+                supported += 1
+        if supported == 0:
+            raise ValueError(
+                f"metric value {val} must be in supported types/values: {SUPPORTED_METRIC_ARGS[key]}."
+            )
+
+
+def validate_early_terminate(early_term_dict):
+    if "min_iter" in early_term_dict and "max_iter" in early_term_dict:
+        raise ValueError("Only either min_iter or max_iter must be provided, not both.")
+    if "max_iter" in early_term_dict and not "s" in early_term_dict:
+        raise KeyError("'s' is required when providing max_iter.")
+    for key, val in early_term_dict.items():
+        if key not in SUPPORTED_EARLY_TERM_ARGS:
+            raise KeyError(
+                f"early_terminate key {key} must be in supported keys: {list(SUPPORTED_EARLY_TERM_ARGS.keys())}."
+            )
+        supported = 0
+        for supported_val in SUPPORTED_EARLY_TERM_ARGS[key]:
+            if isclass(supported_val) and isinstance(val, supported_val):
+                supported += 1
+            elif not isclass(supported_val) and val == supported_val:
+                supported += 1
+        if supported == 0:
+            raise ValueError(
+                f"early_terminate value {val} must be in supported types/values: "
+                f"{SUPPORTED_EARLY_TERM_ARGS[key]}."
+            )
+
+
+def validate_method_and_param_constraints(method, params_dict):
+    if method not in SUPPORTED_SEARCH_METHODS_AND_CONSTRAINTS:
+        raise ValueError(
+            f"method {method} must be in supported search methods: "
+            f"{list(SUPPORTED_SEARCH_METHODS_AND_CONSTRAINTS.keys())}."
+        )
+    constraints = SUPPORTED_SEARCH_METHODS_AND_CONSTRAINTS[method]
+    for param_vals in params_dict.values():
+        if not any(constraint in param_vals.keys() for constraint in constraints):
+            raise ValueError(
+                f"method {method} can only contain supported parameter constraints: "
+                f"{constraints}. Offending param: {param_vals}"
+            )
+
+
+"""
+Python helper functions.
+"""
 
 
 def _flatten_dict_gen(d, parent_key, sep):
@@ -265,7 +396,8 @@ class WandbSweeperImpl(Sweeper):
         if params is not None:
             assert isinstance(params, DictConfig)
             self.params = {
-                str(x): create_wandb_param_from_config(y) for x, y in params.items()
+                str(x): create_wandb_param_from_config(y, wandb_sweep_config.method)
+                for x, y in params.items()
             }
 
         self.agent_run_count: Optional[int] = None
@@ -307,6 +439,7 @@ class WandbSweeperImpl(Sweeper):
             self.sweep_dict.update(
                 {"metric": OmegaConf.to_container(metric, resolve=True)}
             )
+            validate_metric(self.sweep_dict["metric"])
 
         if early_terminate:
             self.sweep_dict.update(
@@ -316,6 +449,7 @@ class WandbSweeperImpl(Sweeper):
                     )
                 }
             )
+            validate_early_terminate(self.sweep_dict["early_terminate"])
 
         self.sweep_id = (
             OmegaConf.to_container(self.sweep_id, resolve=True)
@@ -356,9 +490,13 @@ class WandbSweeperImpl(Sweeper):
                 # Overriding wandb config params with wandb command line args
                 wandb_params[
                     override.get_key_element()
-                ] = create_wandb_param_from_override(override)
+                ] = create_wandb_param_from_override(
+                    override, self.sweep_dict["method"]
+                )
             else:
                 hydra_overrides.append(override)
+
+        validate_method_and_param_constraints(self.sweep_dict["method"], wandb_params)
 
         logger.info(
             f"WandbSweeper(method={self.wandb_sweep_config.method}, "

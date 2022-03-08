@@ -12,11 +12,17 @@ hydra:
       # (Required) Specify the search strategy.
       method: bayes
 
-      # (Optional)Specify the metric to optimize (only used by certain search
+      # (Optional) Specify the metric to optimize (only used by certain search
       # strategies and stopping criteria). Default is {}.
       metric:
         name: out
         goal: minimize
+
+        # (Optional) Goal value for the metric you're optimizing. When any run
+        # in the sweep achieves that target value, the sweep's state will be set
+        # to finished. This means all agents with active runs will finish those
+        # jobs, but no new runs will be launched in the sweep.
+        # target: 0.0
 
       # (Optional) Number of agents to launch in a batch until budget is
       # reached. Use a multi-processing launcher to have these agents execute
