@@ -90,8 +90,9 @@ def _my_gitrepo_init(self, root=None, remote="origin", lazy=True):
     self.remote_name = remote
     self._root = __original_cwd__ if root is None else root
     self._repo = None
+    self._repo_initialized = False
     if not lazy:
-        self.repo
+        self._repo = self._init_repo()
 
 
 # Monkeypatching GitRepo to use the original working directory as the root.
@@ -101,7 +102,7 @@ def _my_gitrepo_init(self, root=None, remote="origin", lazy=True):
 # before the task function is pickled via executor.map_array. After unpickling at the node for task fn execution,
 # the reference wandb.sdk.lib.git.GitRepo.__init__ -> _my_gitrepo_init is still preserved with original_cwd within
 # _my_gitrepo_init preserving its previous value.
-wandb.sdk.lib.git.GitRepo.__init__ = _my_gitrepo_init
+wandb.sdk.lib.gitlib.GitRepo.__init__ = _my_gitrepo_init
 
 
 def _my_save_config_file_from_dict(config_filename, config_dict):
@@ -133,7 +134,7 @@ wandb.sdk.lib.config_util.save_config_file_from_dict = _my_save_config_file_from
 def _my_get_program_relpath_from_gitrepo(
     program: str, _logger: Optional[_EarlyLogger] = None
 ) -> Optional[str]:
-    repo = wandb.sdk.lib.git.GitRepo()
+    repo = wandb.sdk.lib.gitlib.GitRepo()
     root = repo.root
     if not root:
         root = os.getcwd()
